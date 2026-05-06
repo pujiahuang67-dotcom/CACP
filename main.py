@@ -7,6 +7,7 @@ from datetime import datetime
 from tqdm import tqdm
 
 # Import custom modules from the src package
+# These modules implement the math defined in Eq. (1) - (5)
 from src.core.topology import MPSCEstimator
 from src.core.calibration import AdaptiveConformalPredictor
 from src.data.loader import CausalDataLoader
@@ -23,29 +24,33 @@ def main(args):
     logger.info(f"Initializing CACP Pipeline for dataset: {args.dataset}")
 
     # 1. Initialization
-    # We use Logic Topology instead of Skeletons for academic precision
+    # We use 'Logical Topology' instead of 'Skeletons' for academic precision
+    # MPSCEstimator handles the mapping phi(r_i) -> (V_i, E_i) defined in Eq. (1)
     estimator = MPSCEstimator(similarity_metric=args.sim_metric)
+    
+    # AdaptiveConformalPredictor implements the scaling and quantile logic
     predictor = AdaptiveConformalPredictor(alpha=args.alpha, gamma=args.gamma)
     data_loader = CausalDataLoader(dataset_name=args.dataset)
 
-    # 2. Data Loading (Stage 1 results)
-    # Load pre-computed LLM outputs: Softmax probabilities and reasoning paths
+    # 2. Data Loading (Algorithm Lines 1-2)
+    # Load pre-computed LLM outputs: Softmax probabilities and K reasoning paths
     logger.info("Stage 1: Loading multi-path reasoning samples and base scores...")
     data_bundle = data_loader.load_inference_results(k_paths=args.k_samples)
     
     # Unpack data
-    base_scores = data_bundle['base_scores']  # S(x,y) = 1 - P(y|x)
-    reasoning_paths = data_bundle['paths']    # K paths per sample
+    base_scores = data_bundle['base_scores']  # Non-conformity score S(x,y) = 1 - P(y|x)
+    reasoning_paths = data_bundle['paths']    # K sampled paths {r_1, ..., r_K}
     labels = data_bundle['labels']
     
-    # 3. MPSC Estimation (Stage 2)
-    # Calculate Multi-Path Structural Consistency (S_TR)
-    logger.info("Stage 2: Quantifying Topological Reliability (MPSC)...")
-    s_tr_scores = []
-    for paths in tqdm(reasoning_paths, desc="Estimating Topology Consistency"):
-        s_tr = estimator.calculate_mpsc(paths)
-        s_tr_scores.append(s_tr)
-    s_tr_array = np.array(s_tr_scores)
+    # 3. MPSC Estimation (Algorithm Lines 3-7)
+    # Calculate Multi-Path Structural Consistency s(x) using Eq. (2)
+    logger.info("Stage 2: Quantifying Multi-Path Structural Consistency (MPSC)...")
+    mpsc_scores = []
+    for paths in tqdm(reasoning_paths, desc="Estimating Logical Topology Consistency"):
+        # Internally executes projection phi and operator f_dep to build G_i
+        s_x = estimator.calculate_mpsc(paths) 
+        mpsc_scores.append(s_x)
+    s_x_array = np.array(mpsc_scores)
 
     # 4. Data Partitioning
     # Standard split for Conformal Prediction: Calibration set and Test set
@@ -58,34 +63,35 @@ def main(args):
     cal_idx = indices[:cal_split]
     test_idx = indices[cal_split:]
 
-    # 5. Adaptive Calibration (Stage 3)
-    # Normalize scores and find the safe quantile threshold (q_hat)
+    # 5. Adaptive Calibration (Algorithm Line 8-10)
+    # Normalize scores using s(x) and find the safe quantile threshold (q_hat)
+    # Implements the logic: R(x,y) = S(x,y) / sigma(x)
     logger.info("Stage 3: Normalizing scores and calibrating on held-out set...")
     cal_true_scores = base_scores[cal_idx, labels[cal_idx]]
-    cal_s_tr = s_tr_array[cal_idx]
+    cal_s_x = s_x_array[cal_idx]
     
-    predictor.calibrate(cal_true_scores, cal_s_tr)
-    logger.info(f"Calibration successful. q_hat determined as: {predictor.q_hat:.6f}")
+    predictor.calibrate(cal_true_scores, cal_s_x)
+    logger.info(f"Calibration successful. q_hat (quantile) determined as: {predictor.q_hat:.6f}")
 
-    # 6. Prediction and Evaluation (Stage 4)
-    # Build valid prediction sets and evaluate coverage/efficiency
-    logger.info("Stage 4: Generating prediction sets for test data...")
+    # 6. Prediction and Evaluation (Algorithm Lines 11-14)
+    # Build valid prediction sets Gamma(x) and evaluate coverage/efficiency
+    logger.info("Stage 4: Generating adaptive prediction sets for test data...")
     test_results = []
     
     for i in tqdm(test_idx, desc="Evaluating Test Samples"):
-        # Construct prediction set C(x) using adaptive threshold
-        p_set = predictor.predict(base_scores[i], s_tr_array[i])
+        # Construct prediction set using adaptive threshold: S(x, y) <= q_hat * sigma(x)
+        p_set = predictor.predict(base_scores[i], s_x_array[i])
         
         test_results.append({
             'sample_id': int(i),
-            's_tr': float(s_tr_array[i]),
+            'mpsc_score': float(s_x_array[i]), # Stored as s(x) for academic reporting
             'is_covered': int(labels[i] in p_set),
             'set_size': len(p_set),
             'prediction_set': p_set.tolist()
         })
 
-    # 7. Detailed Reporting (including Hard Slices)
-    # Analyze performance on 'Topological Collapse' cases
+    # 7. Detailed Reporting
+    # Analyze performance, especially on 'topological collapse' (low consistency) cases
     metrics = compute_detailed_metrics(test_results, threshold=0.3)
     
     logger.info("="*50)
@@ -100,23 +106,28 @@ def main(args):
         output_path = f"results/{args.dataset}_CACP_{timestamp}.json"
         os.makedirs("results", exist_ok=True)
         with open(output_path, 'w') as f:
-            json.dump({'args': vars(args), 'metrics': metrics, 'raw': test_results}, f, indent=4)
+            json.dump({
+                'framework': 'Causal-Adaptive Conformal Prediction (CACP)',
+                'args': vars(args), 
+                'metrics': metrics, 
+                'raw': test_results
+            }, f, indent=4)
         logger.info(f"Results saved to {output_path}")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Causal-Adaptive Conformal Prediction (CACP)")
     
-    # Dataset and Path arguments
+    # Dataset and Sampling arguments
     parser.add_argument("--dataset", type=str, default="e-care", help="Target causal benchmark")
-    parser.add_argument("--k_samples", type=int, default=5, help="Number of reasoning paths per query")
+    parser.add_argument("--k_samples", type=int, default=5, help="Number of reasoning paths K")
     
-    # CP Hyperparameters
-    parser.add_argument("--alpha", type=float, default=0.1, help="Allowed error rate (miscoverage)")
-    parser.add_argument("--gamma", type=float, default=1.0, help="Scaling intensity for S_TR")
+    # Conformal Prediction Hyperparameters
+    parser.add_argument("--alpha", type=float, default=0.1, help="Allowed error rate (1 - coverage)")
+    parser.add_argument("--gamma", type=float, default=1.0, help="Scaling intensity for MPSC score")
     parser.add_argument("--cal_ratio", type=float, default=0.5, help="Calibration set proportion")
     
-    # Algorithm Settings
-    parser.add_argument("--sim_metric", type=str, default="jaccard", help="Graph similarity metric")
+    # Logical Topology Settings
+    parser.add_argument("--sim_metric", type=str, default="jaccard", help="Graph similarity metric for MPSC")
     parser.add_argument("--seed", type=int, default=2026, help="Random seed for reproducibility")
     parser.add_argument("--save_results", action="store_true", default=True)
 
